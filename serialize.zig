@@ -58,10 +58,6 @@ const Serializable = []const SerializableVersion;
 
 const SerFieldInfo = struct { name: []const u8, info: Record.Info };
 
-fn ReifySerializable(comptime serializable: Serializable) type {
-    return ReifySerializableWithError(serializable, false);
-}
-
 fn getVersionHash(comptime field_infos: []const SerFieldInfo) u32 {
     var hash = std.hash.XxHash32.init(108501602);
     for (field_infos) |field| {
@@ -82,9 +78,7 @@ fn getVersionHash(comptime field_infos: []const SerFieldInfo) u32 {
     return hash.final();
 }
 
-fn ReifySerializableWithError(comptime serializable: Serializable, comptime comptime_error: bool) brk: {
-    if (comptime_error) break :brk !type else break :brk type;
-} {
+fn ReifySerializable(comptime serializable: Serializable) type {
     // poors man hashmap
     const Store = struct { name: []const u8, info: Record.Info, deleted: bool };
     var fields_info: [256]Store = undefined;
@@ -99,10 +93,7 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
                     for (fields_slice) |*field| {
                         if (std.mem.eql(u8, field.name, add.name)) {
                             if (!field.deleted) {
-                                if (comptime_error)
-                                    return error.AddingValueThatAlreadyExsists
-                                else
-                                    @compileError("Can't add field " ++ add.name ++ " as it already exists in previous version");
+                                @compileError("Can't add field " ++ add.name ++ " as it already exists in previous version");
                             }
                             field.info = add.info;
                             field.deleted = false;
@@ -121,19 +112,13 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
                     for (fields_slice) |*field| {
                         if (std.mem.eql(u8, field.name, del.name)) {
                             if (field.deleted) {
-                                if (comptime_error)
-                                    return error.FieldAlreadyDeleted
-                                else
-                                    @compileError("Can't remove field " ++ del.name ++ " as it was already removed in previous version");
+                                @compileError("Can't remove field " ++ del.name ++ " as it was already removed in previous version");
                             }
                             field.deleted = true;
                             break;
                         }
                     } else {
-                        if (comptime_error)
-                            return error.FieldDoentExist
-                        else
-                            @compileError("Can't remove field " ++ del.name ++ " as it does not exist");
+                        @compileError("Can't remove field " ++ del.name ++ " as it does not exist");
                     }
                 },
             }
@@ -163,8 +148,8 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
                 switch (field.info.type) {
                     .type => |t| break :brk t,
                     .serializable => |ser| {
-                        const R = ReifySerializableWithError(ser, comptime_error);
-                        break :brk if (comptime_error) try R.CurrentVersion.T else R.CurrentVersion.T;
+                        const R = ReifySerializable(ser);
+                        break :brk R.CurrentVersion.T;
                     },
                 }
             };
@@ -210,7 +195,7 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
                             };
                         },
                         .serializable => |ser| {
-                            const R = ReifySerializableWithError(ser, comptime_error);
+                            const R = ReifySerializable(ser);
                             @field(value, field.name) = try R.deserialize(reader);
                         },
                     }
@@ -257,7 +242,7 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
                         }
                     },
                     .serializable => |ser| {
-                        const SerT = ReifySerializableWithError(ser, comptime_error);
+                        const SerT = ReifySerializable(ser);
                         try SerT.serialize(@field(value, field.name), writer);
                     },
                 }
