@@ -68,6 +68,15 @@ fn getVersionHash(comptime field_infos: []const SerFieldInfo) u32 {
         hash.update(field.name);
         if (field.info.type == .type) {
             hash.update(@typeName(field.info.type.type));
+            switch (@typeInfo(field.info.type.type)) {
+                .Struct => |S| {
+                    for (S.fields) |struct_field| {
+                        hash.update(struct_field.name);
+                        hash.update(@typeName(struct_field.type));
+                    }
+                },
+                else => {},
+            }
         }
     }
     return hash.final();
@@ -194,7 +203,11 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
                 inline for (version_fields) |field| {
                     switch (field.info.type) {
                         .type => |FieldType| {
-                            @field(value, field.name) = try reader.readIntBig(FieldType);
+                            @field(value, field.name) = switch (@typeInfo(FieldType)) {
+                                .Int => try reader.readIntBig(FieldType),
+                                .Struct => try reader.readStruct(FieldType),
+                                else => @compileError("Can't unserialize " ++ @typeName(FieldType)),
+                            };
                         },
                         .serializable => |ser| {
                             const R = ReifySerializableWithError(ser, comptime_error);
@@ -237,7 +250,11 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
             inline for (CurrentVersion.version_fields) |field| {
                 switch (field.info.type) {
                     .type => |FieldType| {
-                        try writer.writeIntBig(FieldType, @field(value, field.name));
+                        switch (@typeInfo(FieldType)) {
+                            .Int => try writer.writeIntBig(FieldType, @field(value, field.name)),
+                            .Struct => try writer.writeStruct(@field(value, field.name)),
+                            else => @compileError("Can't serialize " ++ @typeName(FieldType)),
+                        }
                     },
                     .serializable => |ser| {
                         const SerT = ReifySerializableWithError(ser, comptime_error);
@@ -287,6 +304,12 @@ fn ReifySerializableWithError(comptime serializable: Serializable, comptime comp
 test {
     const R = Record;
 
+    const TestStruct = packed struct {
+        x: u16 = 0,
+        y: u16 = 42,
+        z: u16 = 0,
+    };
+
     const child: Serializable = &.{&.{
         R.add("foo", u8, 99),
         R.add("bar", u8, 10),
@@ -301,6 +324,8 @@ test {
         &.{
             R.add("decay", u8, 0),
             R.add("sustain", u8, 0),
+            //R.add("array", [8]u8, [_]u8{0} ** 8), // TODO : Support static arrays
+            R.add("vector", TestStruct, TestStruct{}),
             R.addSer("foobar", child),
         },
         // V2
@@ -318,6 +343,7 @@ test {
 
         try std.testing.expectEqual(@as(u8, 99), t.foobar.foo);
         try std.testing.expectEqual(@as(u8, 42), t.attack);
+        try std.testing.expectEqual(@as(u16, 42), t.vector.y);
 
         t.attack = 123;
         t.foobar.bar = 211;
