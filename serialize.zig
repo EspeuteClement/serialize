@@ -188,11 +188,7 @@ fn ReifySerializable(comptime serializable: Serializable) type {
                 inline for (version_fields) |field| {
                     switch (field.info.type) {
                         .type => |FieldType| {
-                            @field(value, field.name) = switch (@typeInfo(FieldType)) {
-                                .Int => try reader.readIntBig(FieldType),
-                                .Struct => try reader.readStruct(FieldType),
-                                else => @compileError("Can't unserialize " ++ @typeName(FieldType)),
-                            };
+                            @field(value, field.name) = try readValue(FieldType, reader);
                         },
                         .serializable => |ser| {
                             const R = ReifySerializable(ser);
@@ -234,12 +230,8 @@ fn ReifySerializable(comptime serializable: Serializable) type {
 
             inline for (CurrentVersion.version_fields) |field| {
                 switch (field.info.type) {
-                    .type => |FieldType| {
-                        switch (@typeInfo(FieldType)) {
-                            .Int => try writer.writeIntBig(FieldType, @field(value, field.name)),
-                            .Struct => try writer.writeStruct(@field(value, field.name)),
-                            else => @compileError("Can't serialize " ++ @typeName(FieldType)),
-                        }
+                    .type => {
+                        try writeValue(@field(value, field.name), writer);
                     },
                     .serializable => |ser| {
                         const SerT = ReifySerializable(ser);
@@ -286,6 +278,43 @@ fn ReifySerializable(comptime serializable: Serializable) type {
     };
 }
 
+fn writeValue(value: anytype, writer: anytype) !void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+    switch (info) {
+        .Int => try writer.writeIntBig(T, value),
+        .Array => {
+            for (value) |v| {
+                try writeValue(v, writer);
+            }
+        },
+        .Struct => |s| {
+            comptime if (s.layout != .Packed) @compileError("Struct must be packed, for more general structs see addSer()");
+            try writer.writeIntBig(s.backing_integer.?, @bitCast(value));
+        },
+        else => @compileError("Can't serialize " ++ @typeName(T)),
+    }
+}
+
+fn readValue(comptime T: type, reader: anytype) !T {
+    const info = @typeInfo(T);
+    switch (info) {
+        .Int => return try reader.readIntBig(T),
+        .Array => |array| {
+            var values: T = undefined;
+            for (&values) |*v| {
+                v.* = try readValue(array.child, reader);
+            }
+            return values;
+        },
+        .Struct => |s| {
+            comptime if (s.layout != .Packed) @compileError("Struct must be packed, for more general structs see addSer()");
+            return @bitCast(try reader.readIntBig(s.backing_integer.?));
+        },
+        else => @compileError("Can't unserialize " ++ @typeName(T)),
+    }
+}
+
 test {
     const R = Record;
 
@@ -309,7 +338,7 @@ test {
         &.{
             R.add("decay", u8, 0),
             R.add("sustain", u8, 0),
-            //R.add("array", [8]u8, [_]u8{0} ** 8), // TODO : Support static arrays
+            R.add("array", [8]u8, [_]u8{69} ** 8), // TODO : Support static arrays
             R.add("vector", TestStruct, TestStruct{}),
             R.addSer("foobar", child),
         },
