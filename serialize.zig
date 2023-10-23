@@ -306,27 +306,54 @@ test {
         // V2
         &.{
             R.del("decay"),
+            // R.del("decay"), // this should not compile
+            // R.add("attack", u16, 99), // this also should not compile
         },
     };
 
     const T = ReifySerializable(ser);
 
-    var t: T.CurrentVersion.T = .{};
+    {
+        var t: T.CurrentVersion.T = .{};
 
-    try std.testing.expectEqual(@as(u8, 99), t.foobar.foo);
-    try std.testing.expectEqual(@as(u8, 42), t.attack);
+        try std.testing.expectEqual(@as(u8, 99), t.foobar.foo);
+        try std.testing.expectEqual(@as(u8, 42), t.attack);
 
-    t.attack = 123;
-    t.foobar.bar = 211;
+        t.attack = 123;
+        t.foobar.bar = 211;
 
-    var buffer: [128]u8 = undefined;
-    var writerBuff = std.io.fixedBufferStream(&buffer);
-    try T.serialize(t, writerBuff.writer());
+        var buffer: [128]u8 = undefined;
+        var writerBuff = std.io.fixedBufferStream(&buffer);
+        try T.serialize(t, writerBuff.writer());
 
-    std.debug.print("\n{any}\n", .{writerBuff.getWritten()});
+        var readerBuff = std.io.fixedBufferStream(&buffer);
+        var unser = try T.deserialize(readerBuff.reader());
 
-    var readerBuff = std.io.fixedBufferStream(&buffer);
-    var unser = try T.deserialize(readerBuff.reader());
+        try std.testing.expectEqualDeep(t, unser);
+    }
 
-    try std.testing.expectEqualDeep(t, unser);
+    {
+        const ser2: Serializable = &.{
+            // V0
+            &.{
+                R.add("attack", u8, 42),
+            },
+        };
+        const T2 = ReifySerializable(ser2);
+        // upgrade
+        var v0: T2.CurrentVersion.T = .{};
+        v0.attack = 123;
+
+        var buffer: [128]u8 = undefined;
+        var writerBuff = std.io.fixedBufferStream(&buffer);
+        try T2.serialize(v0, writerBuff.writer());
+
+        var expected: T.CurrentVersion.T = .{};
+        expected.attack = 123;
+
+        var readerBuff = std.io.fixedBufferStream(&buffer);
+        var unser = try T.deserialize(readerBuff.reader());
+
+        try std.testing.expectEqualDeep(expected, unser);
+    }
 }
