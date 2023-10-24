@@ -3,7 +3,9 @@ const std = @import("std");
 const Record = union(enum) {
     Add: Add,
     Delete: Delete,
-    //Convert: *const fn (from: anytype, to: anytype) void,
+    Convert: ConvertFunc,
+
+    pub const ConvertFunc = *const fn (from: anytype, to: anytype) void;
 
     pub const Add = struct {
         name: []const u8,
@@ -87,6 +89,8 @@ fn ReifySerializable(comptime serializable: Serializable) type {
     comptime var versionTypes: [serializable.len]type = undefined;
 
     for (serializable, 0..) |version, version_id| {
+        var convertFunc: ?Record.ConvertFunc = null;
+
         for (version) |record| {
             switch (record) {
                 .Add => |add| {
@@ -120,6 +124,11 @@ fn ReifySerializable(comptime serializable: Serializable) type {
                     } else {
                         @compileError("Can't remove field " ++ del.name ++ " as it does not exist");
                     }
+                },
+                .Convert => |func| {
+                    if (convertFunc != null)
+                        @compileError("A convert func already defined for this version");
+                    convertFunc = func;
                 },
             }
         }
@@ -179,6 +188,8 @@ fn ReifySerializable(comptime serializable: Serializable) type {
 
         const PreviousVersionType = if (version_id > 1) versionTypes[version_id - 1] else versionTypes[0];
 
+        const finalConvert = convertFunc;
+
         versionTypes[version_id] = struct {
             pub const T = VersionType;
             pub const version_fields = field_packed_final;
@@ -215,7 +226,9 @@ fn ReifySerializable(comptime serializable: Serializable) type {
                     @field(ours, field.name) = @field(prev, field.name);
                 }
 
-                // todo : add user conversion routines
+                if (finalConvert) |f| {
+                    f(prev, &ours);
+                }
             }
         };
     }
