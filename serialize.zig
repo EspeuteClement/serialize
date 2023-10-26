@@ -19,13 +19,49 @@ const Record = union(enum) {
 
         const FieldType = union(enum) {
             type: type,
-            serializable: Serializable,
+            serializable: type,
         };
 
         const Size = enum {
             One,
             Many,
         };
+
+        pub fn getType(comptime self: Info) type {
+            return switch (self.size) {
+                .One => self.getSimpleType(),
+                .Many => []self.getSimpleType(),
+            };
+        }
+
+        pub fn getSimpleType(comptime self: Info) type {
+            return switch (self.type) {
+                .type => |t| t,
+                .serializable => |s| s.CurrentVersion.T,
+            };
+        }
+
+        fn deserializeOne(comptime self: Info, reader: anytype, allocator: ?std.mem.Allocator) !self.getSimpleType() {
+            switch (self.type) {
+                .type => |T| {
+                    return readValue(T, reader);
+                },
+                .serializable => |ser| {
+                    return ser.deserialize(reader, allocator);
+                },
+            }
+        }
+
+        fn serializeOne(comptime self: Info, value: self.getSimpleType(), writer: anytype) !void {
+            switch (self.type) {
+                .type => {
+                    try writeValue(value, writer);
+                },
+                .serializable => |ser| {
+                    try ser.serialize(value, writer);
+                },
+            }
+        }
     };
 
     pub const Delete = struct {
@@ -48,6 +84,16 @@ const Record = union(enum) {
         } } };
     }
 
+    pub fn addSerMany(comptime name: []const u8, comptime ser: Serializable) Record {
+        var SerT = ReifySerializable(ser);
+        const def: []SerT.CurrentVersion.T = &.{};
+        return .{ .Add = .{ .name = name, .info = .{
+            .type = .{ .serializable = SerT },
+            .default = @ptrCast(&def),
+            .size = .Many,
+        } } };
+    }
+
     pub fn del(comptime name: []const u8) Record {
         return .{ .Delete = .{
             .name = name,
@@ -58,7 +104,10 @@ const Record = union(enum) {
 const SerializableVersion = []const Record;
 const Serializable = []const SerializableVersion;
 
-const SerFieldInfo = struct { name: []const u8, info: Record.Info };
+const SerFieldInfo = struct {
+    name: []const u8,
+    info: Record.Info,
+};
 
 fn getVersionHash(comptime field_infos: []const SerFieldInfo) u32 {
     var hash = std.hash.XxHash32.init(108501602);
@@ -153,15 +202,7 @@ fn ReifySerializable(comptime serializable: Serializable) type {
             };
 
             var def_value = field.info.default;
-            var T: type = brk: {
-                switch (field.info.type) {
-                    .type => |t| break :brk t,
-                    .serializable => |ser| {
-                        const R = ReifySerializable(ser);
-                        break :brk R.CurrentVersion.T;
-                    },
-                }
-            };
+            var T: type = field.info.getType();
 
             if (def_value == null) {
                 const def: T = std.mem.zeroInit(T, .{});
@@ -195,15 +236,24 @@ fn ReifySerializable(comptime serializable: Serializable) type {
             pub const version_fields = field_packed_final;
             pub const hash = getVersionHash(&version_fields);
 
-            pub fn deserialize(value: *T, reader: anytype) !void {
+            pub fn deserialize(value: *T, reader: anytype, allocator: ?std.mem.Allocator) !void {
                 inline for (version_fields) |field| {
-                    switch (field.info.type) {
-                        .type => |FieldType| {
-                            @field(value, field.name) = try readValue(FieldType, reader);
+                    switch (field.info.size) {
+                        .One => {
+                            @field(value, field.name) = try field.info.deserializeOne(reader, allocator);
                         },
-                        .serializable => |ser| {
-                            const R = ReifySerializable(ser);
-                            @field(value, field.name) = try R.deserialize(reader);
+                        .Many => {
+                            if (allocator) |alloc| {
+                                var alloc_count = try reader.readIntLittle(u16);
+
+                                var buffer = try alloc.alloc(field.info.getSimpleType(), alloc_count);
+                                @field(value, field.name) = buffer;
+                                for (buffer) |*item| {
+                                    item.* = try field.info.deserializeOne(reader, allocator);
+                                }
+                            } else {
+                                return error.MissingAlloc;
+                            }
                         },
                     }
                 }
@@ -238,40 +288,44 @@ fn ReifySerializable(comptime serializable: Serializable) type {
         const CurrentVersion: type = versionTypes[versionTypes.len - 1];
 
         pub fn serialize(value: CurrentVersion.T, writer: anytype) !void {
-            try writer.writeIntBig(u16, versionTypes.len - 1);
-            try writer.writeIntBig(u32, CurrentVersion.hash);
+            try writer.writeIntLittle(u16, versionTypes.len - 1);
+            try writer.writeIntLittle(u32, CurrentVersion.hash);
 
             inline for (CurrentVersion.version_fields) |field| {
-                switch (field.info.type) {
-                    .type => {
-                        try writeValue(@field(value, field.name), writer);
-                    },
-                    .serializable => |ser| {
-                        const SerT = ReifySerializable(ser);
-                        try SerT.serialize(@field(value, field.name), writer);
+                switch (field.info.size) {
+                    .One => try field.info.serializeOne(@field(value, field.name), writer),
+                    .Many => {
+                        if (std.math.cast(u16, @field(value, field.name).len)) |len| {
+                            try writer.writeIntLittle(u16, len);
+                            for (@field(value, field.name)) |item| {
+                                try field.info.serializeOne(item, writer);
+                            }
+                        } else {
+                            return error.SliceTooBig;
+                        }
                     },
                 }
             }
         }
 
-        pub fn deserialize(reader: anytype) !CurrentVersion.T {
-            const version_id: usize = @intCast(try reader.readIntBig(u16));
+        pub fn deserialize(reader: anytype, allocator: ?std.mem.Allocator) !CurrentVersion.T {
+            const version_id: usize = @intCast(try reader.readIntLittle(u16));
             if (version_id > versions.len)
                 return error.UnknownVersion;
 
-            return deserializeVersionRec(0, version_id, reader, null);
+            return deserializeVersionRec(0, version_id, reader, null, allocator);
         }
 
-        inline fn deserializeVersionRec(comptime current_version: usize, start_version: usize, reader: anytype, value: ?versions[current_version].T) !CurrentVersion.T {
+        inline fn deserializeVersionRec(comptime current_version: usize, start_version: usize, reader: anytype, value: ?versions[current_version].T, allocator: ?std.mem.Allocator) !CurrentVersion.T {
             var val = value;
             const Version = versions[current_version];
             if (current_version == start_version) {
-                var hash = try reader.readIntBig(u32);
+                var hash = try reader.readIntLittle(u32);
                 if (hash != Version.hash)
                     return error.WrongVersionHash;
 
                 val = .{};
-                try Version.deserialize(&val.?, reader);
+                try Version.deserialize(&val.?, reader, allocator);
             }
 
             if (current_version < versions.len - 1) {
@@ -283,7 +337,7 @@ fn ReifySerializable(comptime serializable: Serializable) type {
                     NextVer.convert(val_not_null, &next_val.?);
                 }
 
-                return try deserializeVersionRec(current_version + 1, start_version, reader, next_val);
+                return try deserializeVersionRec(current_version + 1, start_version, reader, next_val, allocator);
             } else {
                 return val.?;
             }
@@ -295,7 +349,7 @@ fn writeValue(value: anytype, writer: anytype) !void {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
     switch (info) {
-        .Int => try writer.writeIntBig(T, value),
+        .Int => try writer.writeIntLittle(T, value),
         .Array => {
             for (value) |v| {
                 try writeValue(v, writer);
@@ -303,7 +357,7 @@ fn writeValue(value: anytype, writer: anytype) !void {
         },
         .Struct => |s| {
             comptime if (s.layout != .Packed) @compileError("Struct must be packed, for more general structs see addSer()");
-            try writer.writeIntBig(s.backing_integer.?, @bitCast(value));
+            try writer.writeIntLittle(s.backing_integer.?, @bitCast(value));
         },
         else => @compileError("Can't serialize " ++ @typeName(T)),
     }
@@ -312,7 +366,7 @@ fn writeValue(value: anytype, writer: anytype) !void {
 fn readValue(comptime T: type, reader: anytype) !T {
     const info = @typeInfo(T);
     switch (info) {
-        .Int => return try reader.readIntBig(T),
+        .Int => return try reader.readIntLittle(T),
         .Array => |array| {
             var values: T = undefined;
             for (&values) |*v| {
@@ -322,9 +376,34 @@ fn readValue(comptime T: type, reader: anytype) !T {
         },
         .Struct => |s| {
             comptime if (s.layout != .Packed) @compileError("Struct must be packed, for more general structs see addSer()");
-            return @bitCast(try reader.readIntBig(s.backing_integer.?));
+            return @bitCast(try reader.readIntLittle(s.backing_integer.?));
         },
         else => @compileError("Can't unserialize " ++ @typeName(T)),
+    }
+}
+
+// Generic struct with slice dealocator
+pub fn deinit(value: anytype, allocator: std.mem.Allocator) void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+
+    switch (info) {
+        .Struct => |str| {
+            inline for (str.fields) |field| {
+                deinit(@field(value, field.name), allocator);
+            }
+        },
+        .Pointer => |ptr| {
+            if (ptr.size != .Slice)
+                @compileError("Struct has non slice pointers");
+            allocator.free(value);
+        },
+        .Array => {
+            for (value) |child| {
+                deinit(child, allocator);
+            }
+        },
+        else => {},
     }
 }
 
@@ -353,7 +432,7 @@ test {
             R.add("sustain", u8, 0),
             R.add("array", [8]u8, [_]u8{69} ** 8), // TODO : Support static arrays
             R.add("vector", TestStruct, TestStruct{}),
-            R.addSer("foobar", child),
+            R.addSerMany("foobar", child),
         },
         // V2
         &.{
@@ -364,23 +443,33 @@ test {
     };
 
     const T = ReifySerializable(ser);
+    const Foobar = ReifySerializable(child);
 
     {
         var t: T.CurrentVersion.T = .{};
 
-        try std.testing.expectEqual(@as(u8, 99), t.foobar.foo);
         try std.testing.expectEqual(@as(u8, 42), t.attack);
         try std.testing.expectEqual(@as(u16, 42), t.vector.y);
 
         t.attack = 123;
-        t.foobar.bar = 211;
+        t.foobar = try std.testing.allocator.alloc(Foobar.CurrentVersion.T, 6);
+        defer std.testing.allocator.free(t.foobar);
+        for (t.foobar, 0..) |*foobar, i| {
+            foobar.* = .{
+                .bar = @intCast(i * 2),
+            };
+        }
+
+        try std.testing.expectEqual(@as(u8, 99), t.foobar[5].foo);
+        try std.testing.expectEqual(@as(u8, 10), t.foobar[5].bar);
 
         var buffer: [128]u8 = undefined;
         var writerBuff = std.io.fixedBufferStream(&buffer);
         try T.serialize(t, writerBuff.writer());
 
         var readerBuff = std.io.fixedBufferStream(&buffer);
-        var unser = try T.deserialize(readerBuff.reader());
+        var unser = try T.deserialize(readerBuff.reader(), std.testing.allocator);
+        defer deinit(unser, std.testing.allocator);
 
         try std.testing.expectEqualDeep(t, unser);
     }
@@ -405,7 +494,7 @@ test {
         expected.attack = 123;
 
         var readerBuff = std.io.fixedBufferStream(&buffer);
-        var unser = try T.deserialize(readerBuff.reader());
+        var unser = try T.deserialize(readerBuff.reader(), std.testing.allocator);
 
         try std.testing.expectEqualDeep(expected, unser);
     }
