@@ -1,6 +1,87 @@
 const std = @import("std");
 
-const Record = union(enum) {
+
+/// # Serialize
+/// ## Disclaimer
+/// This library has not been thoroughly tested against malicious data and properly fused.
+/// Most of the library assumes that the reader interface will properly handle data that is
+/// too long. There is also currently no checksum in place to check if the data has been
+/// properly deserialized.
+/// Use at your own risk.
+/// ## Goals
+/// Proof of concept serialization library for zig, with built in versioning and
+/// backwards compatibility (can open previous version of serialized data), with
+/// support for custom upgrade functions, serializable inside a serializable struct and
+/// slices.
+/// ## Usage
+/// Use the `Serializable` function to create a Struct that will contains the following decls :
+/// - `Struct` : The actual struct you can use to store your data
+/// - `serialize(value: Struct, writer: anytype) !void` : The function that will allow you to serialize your data
+/// to the writer struct of your choice as a binary stream.
+/// - `deserialize(reader:anytype, allocator: ?std.mem.Allocator) !Struct` : The function to transform data outputted by the serialize function back to a Struct. Optionally takes an allocator if Struct has some dynamically allocated data (if you used `Record.addMany()` or `Record.addSerMany()` inside).
+///
+/// The `Serializable` function takes a Definition as its sole parameter. This `Definition` is a slice of `Version`, which is a slice of `Record`
+/// Records are additions or removals of fields to the final struct. Here's an example :
+/// ```zig
+///     const ser: Definition = &.{
+///         // V0
+///         &.{
+///             Record.add("foo", u8, 42),
+///         },
+///         // V1
+///         &.{
+///             Record.add("bar", u8, 0),
+///             Record.remove("foo"),
+///         },
+///     };
+///
+///     var Ser = Serializable(Definition);
+///     var ser : Ser.Struct;
+///     ser.bar = 99;
+///
+///     // serialize to a writer
+///     Ser.serialize(ser, writer);
+///
+///     // deserialize from a reader
+///     var other_ser = Ser.deserialize(reader, null);
+/// ```
+/// We can see that the Version 0 of our struct will only have a `foo` field that is an u8 and will have a default value of 42
+/// then in version 1 we add the `bar` field and remove the old `foo` field.
+/// The Serializable(ser) function will then gives us a struct with the decl Struct equals to
+/// Struct = struct {
+///     bar : u8 = 0,
+/// };
+/// ## Supported features
+/// - Serialize arbitrary integer values
+/// - Serialize arbitrary packed structs
+/// - Serialize arrays of the above types
+/// - Serialize other serializable objects : use Record.addSer();
+/// - Serialize slices of the above types : use Record.addMany() or Record.addSerMany();
+/// Floating point types are not supported as they don't have a portable memory layout representation
+/// ## Binary format
+/// ```
+/// header :
+///     struct_version: u16
+///     struct_hash: u32  // Struct hash is a hash of the name and types of all the fields present in this version of the struct, used
+///                       // to check if the saved struct has the same layout as the one we are trying to load
+///
+/// fields :
+///     for each field in the struct:
+///         if the value is a simple type:
+///             the value serialized as a little endian integer
+///         if the value is an array type:
+///             for array.len:
+///                 the value serialized as a little endian integer
+///         if the value is a serializable
+///             the serializable serialized with its header
+///         if the value is a slice
+///             length of the slice: u16
+///             then the value serialized as one of the above types
+/// ```
+pub const Version = []const Record;
+pub const Definition = []const Version;
+
+pub const Record = union(enum) {
     Add: Add,
     Delete: Delete,
     Convert: ConvertFunc,
@@ -37,7 +118,7 @@ const Record = union(enum) {
         pub fn getSimpleType(comptime self: Info) type {
             return switch (self.type) {
                 .type => |t| t,
-                .serializable => |s| s.CurrentVersion.T,
+                .serializable => |s| s.Struct,
             };
         }
 
@@ -76,7 +157,15 @@ const Record = union(enum) {
         } } };
     }
 
-    pub fn addSer(comptime name: []const u8, comptime ser: Serializable) Record {
+    pub fn addMany(comptime name: []const u8, comptime T: type, comptime def: []const T) Record {
+        return .{ .Add = .{ .name = name, .info = .{
+            .type = .{ .type = T },
+            .default = @ptrCast(&def),
+            .size = .Many,
+        } } };
+    }
+
+    pub fn addSer(comptime name: []const u8, comptime ser: Definition) Record {
         return .{ .Add = .{ .name = name, .info = .{
             .type = .{ .serializable = ser },
             .default = null,
@@ -84,9 +173,9 @@ const Record = union(enum) {
         } } };
     }
 
-    pub fn addSerMany(comptime name: []const u8, comptime ser: Serializable) Record {
-        var SerT = ReifySerializable(ser);
-        const def: []SerT.CurrentVersion.T = &.{};
+    pub fn addSerMany(comptime name: []const u8, comptime ser: Definition) Record {
+        var SerT = Serializable(ser);
+        const def: []SerT.Struct = &.{};
         return .{ .Add = .{ .name = name, .info = .{
             .type = .{ .serializable = SerT },
             .default = @ptrCast(&def),
@@ -101,35 +190,7 @@ const Record = union(enum) {
     }
 };
 
-const SerializableVersion = []const Record;
-const Serializable = []const SerializableVersion;
-
-const SerFieldInfo = struct {
-    name: []const u8,
-    info: Record.Info,
-};
-
-fn getVersionHash(comptime field_infos: []const SerFieldInfo) u32 {
-    var hash = std.hash.XxHash32.init(108501602);
-    for (field_infos) |field| {
-        hash.update(field.name);
-        if (field.info.type == .type) {
-            hash.update(@typeName(field.info.type.type));
-            switch (@typeInfo(field.info.type.type)) {
-                .Struct => |S| {
-                    for (S.fields) |struct_field| {
-                        hash.update(struct_field.name);
-                        hash.update(@typeName(struct_field.type));
-                    }
-                },
-                else => {},
-            }
-        }
-    }
-    return hash.final();
-}
-
-fn ReifySerializable(comptime serializable: Serializable) type {
+pub fn Serializable(comptime serializable: Definition) type {
     // poors man hashmap
     const Store = struct { name: []const u8, info: Record.Info, deleted: bool };
     var fields_info: [256]Store = undefined;
@@ -232,11 +293,11 @@ fn ReifySerializable(comptime serializable: Serializable) type {
         const finalConvert = convertFunc;
 
         versionTypes[version_id] = struct {
-            pub const T = VersionType;
+            pub const Struct = VersionType;
             pub const version_fields = field_packed_final;
             pub const hash = getVersionHash(&version_fields);
 
-            pub fn deserialize(value: *T, reader: anytype, allocator: ?std.mem.Allocator) !void {
+            pub fn deserialize(value: *Struct, reader: anytype, allocator: ?std.mem.Allocator) !void {
                 inline for (version_fields) |field| {
                     switch (field.info.size) {
                         .One => {
@@ -259,7 +320,7 @@ fn ReifySerializable(comptime serializable: Serializable) type {
                 }
             }
 
-            pub fn convert(prev: PreviousVersionType.T, ours: *VersionType) void {
+            pub fn convert(prev: PreviousVersionType.Struct, ours: *VersionType) void {
                 main: inline for (PreviousVersionType.version_fields) |field| {
                     // Only copy if field was not removed by next version
                     inline for (version) |record| {
@@ -283,11 +344,13 @@ fn ReifySerializable(comptime serializable: Serializable) type {
         };
     }
 
-    return struct {
-        const versions: [versionTypes.len]type = versionTypes;
-        const CurrentVersion: type = versionTypes[versionTypes.len - 1];
+    const versions: [versionTypes.len]type = versionTypes;
+    const CurrentVersion: type = versionTypes[versionTypes.len - 1];
 
-        pub fn serialize(value: CurrentVersion.T, writer: anytype) !void {
+    return struct {
+        pub const Struct = CurrentVersion.Struct;
+
+        pub fn serialize(value: Struct, writer: anytype) !void {
             try writer.writeIntLittle(u16, versionTypes.len - 1);
             try writer.writeIntLittle(u32, CurrentVersion.hash);
 
@@ -308,7 +371,7 @@ fn ReifySerializable(comptime serializable: Serializable) type {
             }
         }
 
-        pub fn deserialize(reader: anytype, allocator: ?std.mem.Allocator) !CurrentVersion.T {
+        pub fn deserialize(reader: anytype, allocator: ?std.mem.Allocator) !Struct {
             const version_id: usize = @intCast(try reader.readIntLittle(u16));
             if (version_id > versions.len)
                 return error.UnknownVersion;
@@ -316,24 +379,24 @@ fn ReifySerializable(comptime serializable: Serializable) type {
             return deserializeVersionRec(0, version_id, reader, null, allocator);
         }
 
-        inline fn deserializeVersionRec(comptime current_version: usize, start_version: usize, reader: anytype, value: ?versions[current_version].T, allocator: ?std.mem.Allocator) !CurrentVersion.T {
+        inline fn deserializeVersionRec(comptime current_version: usize, start_version: usize, reader: anytype, value: ?versions[current_version].Struct, allocator: ?std.mem.Allocator) !Struct {
             var val = value;
-            const Version = versions[current_version];
+            const ThisVersion = versions[current_version];
             if (current_version == start_version) {
                 var hash = try reader.readIntLittle(u32);
-                if (hash != Version.hash)
+                if (hash != ThisVersion.hash)
                     return error.WrongVersionHash;
 
                 val = .{};
-                try Version.deserialize(&val.?, reader, allocator);
+                try ThisVersion.deserialize(&val.?, reader, allocator);
             }
 
             if (current_version < versions.len - 1) {
                 const NextVer = versions[current_version + 1];
 
-                var next_val: ?NextVer.T = null;
+                var next_val: ?NextVer.Struct = null;
                 if (val) |val_not_null| {
-                    next_val = NextVer.T{};
+                    next_val = NextVer.Struct{};
                     NextVer.convert(val_not_null, &next_val.?);
                 }
 
@@ -343,6 +406,58 @@ fn ReifySerializable(comptime serializable: Serializable) type {
             }
         }
     };
+}
+
+// Generic struct with slice dealocator
+pub fn deinit(value: anytype, allocator: std.mem.Allocator) void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+
+    switch (info) {
+        .Struct => |str| {
+            inline for (str.fields) |field| {
+                deinit(@field(value, field.name), allocator);
+            }
+        },
+        .Pointer => |ptr| {
+            if (ptr.size != .Slice)
+                @compileError("Struct has non slice pointers");
+            allocator.free(value);
+        },
+        .Array => {
+            for (value) |child| {
+                deinit(child, allocator);
+            }
+        },
+        else => {},
+    }
+}
+
+// Implementation details
+
+const SerFieldInfo = struct {
+    name: []const u8,
+    info: Record.Info,
+};
+
+fn getVersionHash(comptime field_infos: []const SerFieldInfo) u32 {
+    var hash = std.hash.XxHash32.init(108501602);
+    for (field_infos) |field| {
+        hash.update(field.name);
+        if (field.info.type == .type) {
+            hash.update(@typeName(field.info.type.type));
+            switch (@typeInfo(field.info.type.type)) {
+                .Struct => |S| {
+                    for (S.fields) |struct_field| {
+                        hash.update(struct_field.name);
+                        hash.update(@typeName(struct_field.type));
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return hash.final();
 }
 
 fn writeValue(value: anytype, writer: anytype) !void {
@@ -382,31 +497,6 @@ fn readValue(comptime T: type, reader: anytype) !T {
     }
 }
 
-// Generic struct with slice dealocator
-pub fn deinit(value: anytype, allocator: std.mem.Allocator) void {
-    const T = @TypeOf(value);
-    const info = @typeInfo(T);
-
-    switch (info) {
-        .Struct => |str| {
-            inline for (str.fields) |field| {
-                deinit(@field(value, field.name), allocator);
-            }
-        },
-        .Pointer => |ptr| {
-            if (ptr.size != .Slice)
-                @compileError("Struct has non slice pointers");
-            allocator.free(value);
-        },
-        .Array => {
-            for (value) |child| {
-                deinit(child, allocator);
-            }
-        },
-        else => {},
-    }
-}
-
 test {
     const R = Record;
 
@@ -416,12 +506,12 @@ test {
         z: u16 = 0,
     };
 
-    const child: Serializable = &.{&.{
+    const child: Definition = &.{&.{
         R.add("foo", u8, 99),
         R.add("bar", u8, 10),
     }};
 
-    const ser: Serializable = &.{
+    const ser: Definition = &.{
         // V0
         &.{
             R.add("attack", u8, 42),
@@ -437,22 +527,23 @@ test {
         // V2
         &.{
             R.del("decay"),
+            R.addMany("name", u8, "frodo baggins"),
             // R.del("decay"), // this should not compile
             // R.add("attack", u16, 99), // this also should not compile
         },
     };
 
-    const T = ReifySerializable(ser);
-    const Foobar = ReifySerializable(child);
+    const T = Serializable(ser);
+    const Foobar = Serializable(child);
 
     {
-        var t: T.CurrentVersion.T = .{};
+        var t: T.Struct = .{};
 
         try std.testing.expectEqual(@as(u8, 42), t.attack);
         try std.testing.expectEqual(@as(u16, 42), t.vector.y);
 
         t.attack = 123;
-        t.foobar = try std.testing.allocator.alloc(Foobar.CurrentVersion.T, 6);
+        t.foobar = try std.testing.allocator.alloc(Foobar.Struct, 6);
         defer std.testing.allocator.free(t.foobar);
         for (t.foobar, 0..) |*foobar, i| {
             foobar.* = .{
@@ -472,25 +563,26 @@ test {
         defer deinit(unser, std.testing.allocator);
 
         try std.testing.expectEqualDeep(t, unser);
+        try std.testing.expectEqualSlices(u8, unser.name, "frodo baggins");
     }
 
     {
-        const ser2: Serializable = &.{
+        const ser2: Definition = &.{
             // V0
             &.{
                 R.add("attack", u8, 42),
             },
         };
-        const T2 = ReifySerializable(ser2);
+        const T2 = Serializable(ser2);
         // upgrade
-        var v0: T2.CurrentVersion.T = .{};
+        var v0: T2.Struct = .{};
         v0.attack = 123;
 
         var buffer: [128]u8 = undefined;
         var writerBuff = std.io.fixedBufferStream(&buffer);
         try T2.serialize(v0, writerBuff.writer());
 
-        var expected: T.CurrentVersion.T = .{};
+        var expected: T.Struct = .{};
         expected.attack = 123;
 
         var readerBuff = std.io.fixedBufferStream(&buffer);
