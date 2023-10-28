@@ -1,7 +1,6 @@
 const std = @import("std");
 
-
-/// # Serialize
+/// # Serialize.zig
 /// ## Disclaimer
 /// This library has not been thoroughly tested against malicious data and properly fused.
 /// Most of the library assumes that the reader interface will properly handle data that is
